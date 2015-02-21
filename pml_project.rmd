@@ -9,7 +9,7 @@ output: html_document
 
 ``` {r do.setup}
 library(knitr)
-opts_chunk$set(messages=FALSE,warnings=FALSE)
+opts_chunk$set(message=FALSE,warning=FALSE)
 
 setwd("~/Dropbox/moocs/practical_machine_learning/")
 library(ggplot2)
@@ -52,7 +52,9 @@ plot.summaries(training.1,'untransformed.pdf')
 
 The untransformed variables have some clear flaws, as evidenced in the plot for `magnet_dumbbell_y`, for instance:
 
-`r print(ggplot(aes(x="magnet_dumbbell_y", fill="classe"), data=training.1) + geom_histogram() + facet_wrap(~ user_name))`
+``` {r}
+print(ggplot(aes(x=magnet_dumbbell_y, fill=classe), data=training.1) + geom_histogram() + facet_wrap(~ user_name))
+```
 
 The majority of values for all users are in a finite, if wide, range, but apparently very sparse extreme values, presumably from sensor malfunctions or other such uninformative processes, jam all the good values into a tiny slice of the dsitribution. In addition, each individual user may have a vastly different mode from the others, which may obscure some of the common structure across users.
 
@@ -89,7 +91,9 @@ training.2 <- select(training.2, -contains("timestamp"), -contains("window"))
 
 This improves the situation quite a bit. For comparison, here is the transformed version of `magnet_dumbbell_y`:
 
-`r print(ggplot(aes(x="magnet_dumbbell_y", fill="classe"), data=training.2) + geom_histogram() + facet_wrap(~ user_name))`
+``` {r}
+print(ggplot(aes(x=magnet_dumbbell_y, fill=classe), data=training.2) + geom_histogram() + facet_wrap(~ user_name))
+```
 
 The transformations are far from perfect. Some variables have a preponderance of zeroes, which are not affected by the scale-and-center, and others have bimodal distributions or other non-normalities which are hard to deal with. So I won't deal with them.
 
@@ -114,7 +118,7 @@ testing.3 <- cbind(user_name=testing[,"user_name"], as.data.frame(impute.knn(as.
 
 #Analysis
 
-A completely naive use-largest-category classification strategy would yield a fairly low baseline: `r max(summary(training.3$classe)/nrow(training.3)) *100`% (classifying to A). 
+A completely naive use-largest-category classification strategy would yield a fairly low baseline correct classification rate: `r max(summary(training.3$classe)/nrow(training.3)) *100`% (classifying to A). 
 
 ##Binary logistic regression
 I think even a completely dumb model can do way better, so I'm going to try a binary logistic regression, just as a first pass. This is doing a slightly different task than the one we're supposed to be doing, since the not-A category lumps together four factor levels, but since A represents 'success,' this is still a potentially interesting model. I don't do cross-validation or regularization or what-have-you since I'm not actually planning to use this model for prediction.
@@ -129,7 +133,7 @@ sum(diag(isc))/sum(isc)
 ```
 
 ##Multinomial regression
-Still, binomial logistic regression's error rate isn't great. Generalizing to a multinomial logistic regression using 10-fold cross validation from glmnet, we get an even lower in-sample error rate than the binary logistic regression for the simplified problem.
+Still, binomial logistic regression's error rate isn't great. Generalizing to a multinomial logistic regression using 10-fold cross validation from glmnet, we get an even higher in-sample error rate than the binary logistic regression for the simplified problem.
 ``` {r multinomial.har, cache=TRUE}
 # multinomial regression
 data.samp.y <- training.3[,"classe"]
