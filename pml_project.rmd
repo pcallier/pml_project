@@ -1,0 +1,181 @@
+---
+title: "PML Project"
+author: "Patrick Callier"
+date: "Feb 11 2015"
+output: html_document
+---
+
+#Loading the data
+
+``` {r do.setup}
+library(knitr)
+opts_chunk$set(messages=FALSE,warnings=FALSE)
+
+setwd("~/Dropbox/moocs/practical_machine_learning/")
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(reshape2)
+library(glmnet)
+library(impute)
+library(randomForest)
+
+set.seed(219)
+
+# should be in same working directory as data
+training <- read.csv("pml-training.csv",row.names=1,na.strings=c("NA","#DIV/0!"),colClasses=c(cvtd_timestamp="character"))
+testing <- read.csv("pml-testing.csv",row.names=1,na.strings=c("NA","#DIV/0!"),colClasses=c(cvtd_timestamp="character"))
+```
+
+#Preparing the data
+
+A first cleaning step is to remove rows where `new_window` takes the value `yes`. These rows appear to contain some sort of summary data for creating derived features, but since our task (in testing) does not give us data that can be summarized in the same way, these features will not be useful. Dropping these rows now leaves entire variables with only `NA` values, so we drop these as well.
+
+``` {r clean.data.1, cache=TRUE}
+# clean up
+training <- transform(training, user_window=as.factor(paste(user_name, num_window)))
+training.1 <- filter(training, new_window=="no")
+training.1 <- Filter(function(.) { !all(is.na(.)) }, training.1 )
+
+# univariate summary plots
+plot.summaries <- function(data, file="summaryplots.pdf") {
+  pdf(file, onefile=TRUE)
+  for (x in names(data)) {
+    if (is.numeric(data[,x])) {
+      print(ggplot(aes_string(x=x, fill="classe"), data=data) + geom_histogram() + facet_wrap(~ user_name))
+    }
+  }
+  dev.off()
+}
+plot.summaries(training.1,'untransformed.pdf')
+```
+
+The untransformed variables have some clear flaws, as evidenced in the plot for `magnet_dumbbell_y`, for instance:
+
+`r print(ggplot(aes(x="magnet_dumbbell_y", fill="classe"), data=training.1) + geom_histogram() + facet_wrap(~ user_name))`
+
+The majority of values for all users are in a finite, if wide, range, but apparently very sparse extreme values, presumably from sensor malfunctions or other such uninformative processes, jam all the good values into a tiny slice of the dsitribution. In addition, each individual user may have a vastly different mode from the others, which may obscure some of the common structure across users.
+
+The below code generates a list of means and standard deviations for each combination of measurement type (varying first) and user (varying within measurement type), then provides a function `do.transforms` that takes as arguments a daa frame in the shape of our data as well as this list of means and standard deviations. This allows the testing data to be transformed according to the same criteria as the training data. THe transform itself is just a scale and center per user of each variable.
+
+``` {r clean.data.2, cache=TRUE}
+# transform within user for each variable
+train.1.pred.indices <- seq(7,58)
+# get a list of user-specific means and sds
+transformer <- lapply(training.1[,train.1.pred.indices], function(.) {
+  return(by(., training.1[,"user_name"], function(x) { list(mu=mean(x), sig=sd(x)) }))
+})
+do.transforms <- function(data, transformer, trim.outliers=NA) {
+  # scale and center data according to a supplied list of means and sds
+  # named according to variable and user_name
+  for (col in names(transformer)) {
+    for (user in names(transformer[[col]])) {
+      data[data$user_name==user,col] <- (data[data$user_name==user,col] - transformer[[col]][[user]][["mu"]]) / transformer[[col]][[user]][["sig"]] 
+    }
+  }
+  if (!is.na(trim.outliers)) {
+    # trim away outliers entirely (deleting the whole observation!)
+    slice <- which(apply(data[,names(transformer)], 1, function(.) {any(abs(.) > 5)}))
+    data <- data[-slice,]
+  }
+  return(data)
+}
+training.2 <- do.transforms(training.1, transformer, 4)
+plot.summaries(training.2, "transformed.pdf")
+
+# clip off timestamps and windows
+training.2 <- select(training.2, -contains("timestamp"), -contains("window"))
+```
+
+This improves the situation quite a bit. For comparison, here is the transformed version of `magnet_dumbbell_y`:
+
+`r print(ggplot(aes(x="magnet_dumbbell_y", fill="classe"), data=training.2) + geom_histogram() + facet_wrap(~ user_name))`
+
+The transformations are far from perfect. Some variables have a preponderance of zeroes, which are not affected by the scale-and-center, and others have bimodal distributions or other non-normalities which are hard to deal with. So I won't deal with them.
+
+The transformations above do introduce a new problem though. For completely invariant data ($\sigma$=0), the scaling zaps them into infinity. I will fill in remaining missing values with a k-nearest neighbors imputation, as below.
+
+
+``` {r clean.data.3, cache=TRUE}
+# do imputation for remaining missings
+training.3 <- cbind(training.2[,c(1, 54)], impute.knn(as.matrix(training.2[,names(transformer)]))$data)
+plot.summaries(training.3, "imputed.pdf")
+```
+
+Finally, we also have to prepare the test data in an analogous fashion to the training data, using the scale-and-center wrapper function defined above and the list of means and standard deviations from the training data. Because the transformation will also do divide-by-zeroes here, I impute again, using the unimputed training data as "neighbors." This is probably less than optimal, but it works.
+
+``` {r clean.data.4}
+# prepare test data, similarly
+testing.2 <- testing[,c("user_name", names(transformer))]
+testing.2 <- do.transforms(testing.2, transformer)
+# impute?!
+testing.3 <- cbind(user_name=testing[,"user_name"], as.data.frame(impute.knn(as.matrix(rbind(testing.2[,names(transformer)], training.2[,names(transformer)])))$data)[1:20,])
+```
+
+#Analysis
+
+A completely naive use-largest-category classification strategy would yield a fairly low baseline: `r max(summary(training.3$classe)/nrow(training.3)) *100`% (classifying to A). 
+
+##Binary logistic regression
+I think even a completely dumb model can do way better, so I'm going to try a binary logistic regression, just as a first pass. This is doing a slightly different task than the one we're supposed to be doing, since the not-A category lumps together four factor levels, but since A represents 'success,' this is still a potentially interesting model. I don't do cross-validation or regularization or what-have-you since I'm not actually planning to use this model for prediction.
+
+``` {r logistic.har, cache=TRUE}
+# binary logistic regression (A vs not-A)
+bar.glm <- glm(classe=="A" ~ ., family=binomial(), data=training.3)
+isc <- table(predict(bar.glm, type="link") > 0, training.3$classe=="A")
+print(isc)
+# Overall in-sample correct classification rate
+sum(diag(isc))/sum(isc)
+```
+
+##Multinomial regression
+Still, binomial logistic regression's error rate isn't great. Generalizing to a multinomial logistic regression using 10-fold cross validation from glmnet, we get an even lower in-sample error rate than the binary logistic regression for the simplified problem.
+``` {r multinomial.har, cache=TRUE}
+# multinomial regression
+data.samp.y <- training.3[,"classe"]
+data.samp.x <- as.matrix(select(training.3, -contains("classe"), -contains("user_name")))
+bar.multi.glmnet <- cv.glmnet(x=data.samp.x, y=data.samp.y, family="multinomial")
+
+bmg.pred <- predict(bar.multi.glmnet, data.samp.x)
+bmg.pred.class <- c("A","B","C","D","E")[apply(bmg.pred, 1, which.max)]
+# in sample confusion
+isc <- table(bmg.pred.class, data.samp.y)
+print(isc)
+# Overall in-sample correct classification rate
+sum(diag(isc))/sum(isc)
+```
+
+##Random forests
+Since multinomial regression is not very good either, let's try random forests, since those are supposed to be awesome. Because of the way random forests are grown (using iterative testing on out-of-bag samples), cross-validation is not necessary.
+
+``` {r random.forests.har, cache=TRUE}
+# random forests
+har.ranfor <- randomForest(classe ~ ., data=training.3)
+har.rf.pred <- predict(har.ranfor)
+isc <- table(har.rf.pred, training.3$classe)
+print(isc)
+
+# Overall in-sample correct classification rate
+sum(diag(isc))/sum(isc)
+# "Out-of-bag" error rate: estimation of out-of-sample error rate,
+# using all the trees grown in the forest
+print(1-har.ranfor$err.rate[length(har.ranfor$err.rate)])
+```
+
+Okay. That is much better. One would almost think that it has overfit, but the people who push random forests always say that random forests do not overfit (again, because of how they are grown). In fact, the out-of-bag correct classification rate for the largest forest is even more optimistic than the correct classification rate computed from the in-sample confusion matrix. The out-of-bag error rate is an estimate of the out-of-sample error rate, so we anticipate `r 100*(1-har.ranfor$err.rate[length(har.ranfor$err.rate)])`% correct classification using this model. Below I generate my answers to the testing problems (no peeking). Three cheers for random forests.
+
+``` {r do.testing}
+answers <- as.character(predict(har.ranfor, testing.3))
+#print(answers)
+
+# submission
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+
+pml_write_files(answers)
+```
